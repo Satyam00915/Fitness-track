@@ -2,7 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
-const pool = require('../db/pool');
+const User = require('../models/User');
 const auth = require('../middleware/auth');
 
 const router = express.Router();
@@ -21,22 +21,23 @@ router.post('/register', [
   const { name, email, password, age, height_cm, weight_kg, fitness_goal } = req.body;
 
   try {
-    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-    if (existing.rows.length > 0) {
+    const existing = await User.findOne({ email });
+    if (existing) {
       return res.status(400).json({ error: 'Email already registered' });
     }
 
     const password_hash = await bcrypt.hash(password, 10);
-    const result = await pool.query(
-      `INSERT INTO users (name, email, password_hash, age, height_cm, weight_kg, fitness_goal)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, name, email, age, height_cm, weight_kg, fitness_goal, created_at`,
-      [name, email, password_hash, age || null, height_cm || null, weight_kg || null, fitness_goal || null]
-    );
+    
+    const user = new User({
+      name, email, password_hash, age, height_cm, weight_kg, fitness_goal
+    });
+    await user.save();
 
-    const user = result.rows[0];
-    const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ id: user._id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
-    res.status(201).json({ token, user });
+    res.status(201).json({ token, user: {
+      id: user._id, name: user.name, email: user.email, age: user.age, height_cm: user.height_cm, weight_kg: user.weight_kg, fitness_goal: user.fitness_goal
+    } });
   } catch (err) {
     console.error('Register error:', err);
     res.status(500).json({ error: 'Server error during registration' });
@@ -56,21 +57,21 @@ router.post('/login', [
   const { email, password } = req.body;
 
   try {
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    if (result.rows.length === 0) {
+    const user = await User.findOne({ email });
+    if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const user = result.rows[0];
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    const { password_hash, ...safeUser } = user;
-
-    res.json({ token, user: safeUser });
+    const token = jwt.sign({ id: user._id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    
+    res.json({ token, user: {
+      id: user._id, name: user.name, email: user.email, age: user.age, height_cm: user.height_cm, weight_kg: user.weight_kg, fitness_goal: user.fitness_goal
+    } });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ error: 'Server error during login' });
@@ -80,14 +81,13 @@ router.post('/login', [
 // GET /api/auth/me
 router.get('/me', auth, async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT id, name, email, age, height_cm, weight_kg, fitness_goal, created_at FROM users WHERE id = $1',
-      [req.user.id]
-    );
-    if (result.rows.length === 0) {
+    const user = await User.findById(req.user.id).select('-password_hash');
+    if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
-    res.json(result.rows[0]);
+    const userResponse = user.toObject();
+    userResponse.id = userResponse._id;
+    res.json(userResponse);
   } catch (err) {
     console.error('Get me error:', err);
     res.status(500).json({ error: 'Server error' });
@@ -107,34 +107,35 @@ router.put('/profile', auth, [
   const { name, email, age, height_cm, weight_kg, fitness_goal, old_password, new_password } = req.body;
 
   try {
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
     // If changing password
     if (new_password) {
       if (!old_password) {
         return res.status(400).json({ error: 'Old password is required to change password' });
       }
-      const userResult = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
-      const valid = await bcrypt.compare(old_password, userResult.rows[0].password_hash);
+      const valid = await bcrypt.compare(old_password, user.password_hash);
       if (!valid) {
         return res.status(400).json({ error: 'Old password is incorrect' });
       }
-      const newHash = await bcrypt.hash(new_password, 10);
-      await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, req.user.id]);
+      user.password_hash = await bcrypt.hash(new_password, 10);
     }
 
-    const result = await pool.query(
-      `UPDATE users SET
-        name = COALESCE($1, name),
-        email = COALESCE($2, email),
-        age = COALESCE($3, age),
-        height_cm = COALESCE($4, height_cm),
-        weight_kg = COALESCE($5, weight_kg),
-        fitness_goal = COALESCE($6, fitness_goal)
-       WHERE id = $7
-       RETURNING id, name, email, age, height_cm, weight_kg, fitness_goal, created_at`,
-      [name || null, email || null, age || null, height_cm || null, weight_kg || null, fitness_goal || null, req.user.id]
-    );
+    if (name !== undefined) user.name = name;
+    if (email !== undefined) user.email = email;
+    if (age !== undefined) user.age = age;
+    if (height_cm !== undefined) user.height_cm = height_cm;
+    if (weight_kg !== undefined) user.weight_kg = weight_kg;
+    if (fitness_goal !== undefined) user.fitness_goal = fitness_goal;
 
-    res.json(result.rows[0]);
+    await user.save();
+    const updatedUser = await User.findById(req.user.id).select('-password_hash');
+    const userResponse = updatedUser.toObject();
+    userResponse.id = userResponse._id;
+    res.json(userResponse);
   } catch (err) {
     console.error('Profile update error:', err);
     res.status(500).json({ error: 'Server error' });
@@ -144,7 +145,7 @@ router.put('/profile', auth, [
 // DELETE /api/auth/account
 router.delete('/account', auth, async (req, res) => {
   try {
-    await pool.query('DELETE FROM users WHERE id = $1', [req.user.id]);
+    await User.findByIdAndDelete(req.user.id);
     res.json({ message: 'Account deleted successfully' });
   } catch (err) {
     console.error('Delete account error:', err);

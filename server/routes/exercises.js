@@ -1,6 +1,7 @@
 const express = require('express');
 const { body, validationResult } = require('express-validator');
-const pool = require('../db/pool');
+const Exercise = require('../models/Exercise');
+const Workout = require('../models/Workout');
 const auth = require('../middleware/auth');
 
 const router = express.Router();
@@ -9,28 +10,29 @@ const router = express.Router();
 router.get('/', async (req, res) => {
   const { q, muscle } = req.query;
   try {
-    let query = `
-      SELECT e.*, u.name as created_by_name
-      FROM exercises e
-      LEFT JOIN users u ON e.created_by = u.id
-      WHERE 1=1
-    `;
-    const params = [];
+    let query = {};
 
     if (q) {
-      params.push(`%${q}%`);
-      query += ` AND LOWER(e.name) LIKE LOWER($${params.length})`;
+      query.name = { $regex: new RegExp(q, 'i') };
     }
 
     if (muscle && muscle !== 'all') {
-      params.push(muscle);
-      query += ` AND e.muscle_group = $${params.length}`;
+      query.muscle_group = muscle;
     }
 
-    query += ' ORDER BY e.is_custom, e.muscle_group, e.name';
+    const exercises = await Exercise.find(query)
+      .populate('created_by', 'name')
+      .sort({ is_custom: 1, muscle_group: 1, name: 1 })
+      .lean();
 
-    const result = await pool.query(query, params);
-    res.json(result.rows);
+    const formattedExercises = exercises.map(ex => ({
+      ...ex,
+      id: ex._id,
+      created_by_name: ex.created_by ? ex.created_by.name : null,
+      created_by: ex.created_by ? ex.created_by._id : null
+    }));
+
+    res.json(formattedExercises);
   } catch (err) {
     console.error('Get exercises error:', err);
     res.status(500).json({ error: 'Server error' });
@@ -50,13 +52,21 @@ router.post('/', auth, [
   const { name, muscle_group, equipment, description } = req.body;
 
   try {
-    const result = await pool.query(
-      `INSERT INTO exercises (name, muscle_group, equipment, description, is_custom, created_by)
-       VALUES ($1, $2, $3, $4, true, $5)
-       RETURNING *`,
-      [name, muscle_group, equipment || null, description || null, req.user.id]
-    );
-    res.status(201).json(result.rows[0]);
+    const exercise = new Exercise({
+      name,
+      muscle_group,
+      equipment,
+      description,
+      is_custom: true,
+      created_by: req.user.id
+    });
+    
+    await exercise.save();
+    
+    const formattedExercise = exercise.toObject();
+    formattedExercise.id = formattedExercise._id;
+    
+    res.status(201).json(formattedExercise);
   } catch (err) {
     console.error('Create exercise error:', err);
     res.status(500).json({ error: 'Server error' });
@@ -66,16 +76,35 @@ router.post('/', auth, [
 // GET /api/exercises/:id/history — exercise usage history for current user
 router.get('/:id/history', auth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT ws.*, w.completed_at, w.title
-       FROM workout_sets ws
-       JOIN workouts w ON ws.workout_id = w.id
-       WHERE ws.exercise_id = $1 AND w.user_id = $2
-       ORDER BY w.completed_at DESC
-       LIMIT 20`,
-      [req.params.id, req.user.id]
-    );
-    res.json(result.rows);
+    const workouts = await Workout.find({ 
+      user_id: req.user.id,
+      'sets.exercise_id': req.params.id 
+    })
+    .sort({ completed_at: -1 })
+    .limit(20)
+    .lean();
+
+    let history = [];
+    workouts.forEach(workout => {
+      workout.sets.forEach(set => {
+        if (set.exercise_id && set.exercise_id.toString() === req.params.id) {
+          history.push({
+            id: set._id,
+            workout_id: workout._id,
+            exercise_id: set.exercise_id,
+            set_number: set.set_number,
+            reps: set.reps,
+            weight_kg: set.weight_kg,
+            duration_seconds: set.duration_seconds,
+            distance_km: set.distance_km,
+            completed_at: workout.completed_at,
+            title: workout.title
+          });
+        }
+      });
+    });
+
+    res.json(history);
   } catch (err) {
     console.error('Exercise history error:', err);
     res.status(500).json({ error: 'Server error' });

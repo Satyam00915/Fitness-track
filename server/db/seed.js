@@ -1,4 +1,6 @@
-const pool = require('./pool');
+const mongoose = require('mongoose');
+require('dotenv').config();
+const Exercise = require('../models/Exercise');
 
 const exercises = [
   // Chest
@@ -57,23 +59,22 @@ const exercises = [
 ];
 
 async function seed() {
-  const client = await pool.connect();
   try {
+    await mongoose.connect(process.env.DATABASE_URL);
     console.log('Seeding exercises...');
     
     // Check if exercises already exist
-    const existing = await client.query('SELECT COUNT(*) FROM exercises WHERE is_custom = false');
-    if (parseInt(existing.rows[0].count) > 0) {
-      console.log(`ℹ️  ${existing.rows[0].count} exercises already seeded. Skipping.`);
+    const count = await Exercise.countDocuments({ is_custom: false });
+    if (count > 0) {
+      console.log(`ℹ️  ${count} exercises already seeded. Skipping.`);
       return;
     }
 
     for (const ex of exercises) {
-      await client.query(
-        `INSERT INTO exercises (name, muscle_group, equipment, description, is_custom)
-         VALUES ($1, $2, $3, $4, false)
-         ON CONFLICT DO NOTHING`,
-        [ex.name, ex.muscle_group, ex.equipment, ex.description]
+      await Exercise.updateOne(
+        { name: ex.name },
+        { $set: { ...ex, is_custom: false } },
+        { upsert: true }
       );
     }
 
@@ -82,8 +83,7 @@ async function seed() {
     console.error('❌ Seed failed:', err.message);
     throw err;
   } finally {
-    client.release();
-    await pool.end();
+    await mongoose.disconnect();
   }
 }
 

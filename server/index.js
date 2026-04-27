@@ -8,8 +8,12 @@ const workoutRoutes = require('./routes/workouts');
 const statsRoutes = require('./routes/stats');
 const metricRoutes = require('./routes/metrics');
 const goalRoutes = require('./routes/goals');
+const connectDB = require('./db/connection');
 
 const app = express();
+
+// Connect to MongoDB
+connectDB();
 
 // CORS
 app.use(cors({

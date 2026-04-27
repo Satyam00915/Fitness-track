@@ -1,5 +1,7 @@
 const express = require('express');
-const pool = require('../db/pool');
+const mongoose = require('mongoose');
+const Workout = require('../models/Workout');
+const Exercise = require('../models/Exercise');
 const auth = require('../middleware/auth');
 
 const router = express.Router();
@@ -10,43 +12,66 @@ router.get('/summary', auth, async (req, res) => {
     const weekAgo = new Date();
     weekAgo.setDate(weekAgo.getDate() - 7);
 
-    // Weekly workouts count
-    const workoutsResult = await pool.query(
-      `SELECT COUNT(*) as count, 
-        COALESCE(SUM(calories_burned), 0) as calories,
-        COALESCE(SUM(duration_minutes), 0) as total_minutes
-       FROM workouts 
-       WHERE user_id = $1 AND completed_at >= $2`,
-      [req.user.id, weekAgo]
-    );
+    const userId = new mongoose.Types.ObjectId(req.user.id);
 
-    // Weekly volume (total kg lifted)
-    const volumeResult = await pool.query(
-      `SELECT COALESCE(SUM(ws.weight_kg * ws.reps), 0) as total_volume
-       FROM workout_sets ws
-       JOIN workouts w ON ws.workout_id = w.id
-       WHERE w.user_id = $1 AND w.completed_at >= $2`,
-      [req.user.id, weekAgo]
-    );
+    // Weekly workouts count, calories, duration and volume
+    const weeklyStats = await Workout.aggregate([
+      { $match: { user_id: userId, completed_at: { $gte: weekAgo } } },
+      { 
+        $project: {
+          calories_burned: 1,
+          duration_minutes: 1,
+          sets: 1
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          count: { $sum: 1 },
+          calories: { $sum: '$calories_burned' },
+          total_minutes: { $sum: '$duration_minutes' },
+          sets_array: { $push: '$sets' }
+        }
+      }
+    ]);
+
+    let volume_this_week = 0;
+    let workouts_this_week = 0;
+    let calories_this_week = 0;
+    let total_minutes = 0;
+
+    if (weeklyStats.length > 0) {
+      workouts_this_week = weeklyStats[0].count;
+      calories_this_week = weeklyStats[0].calories || 0;
+      total_minutes = weeklyStats[0].total_minutes || 0;
+      
+      weeklyStats[0].sets_array.forEach(sets => {
+        sets.forEach(set => {
+          if (set.weight_kg && set.reps) {
+            volume_this_week += (set.weight_kg * set.reps);
+          }
+        });
+      });
+    }
 
     // Streak calculation
-    const streakResult = await pool.query(
-      `SELECT DISTINCT DATE(completed_at) as workout_date
-       FROM workouts
-       WHERE user_id = $1 AND completed_at >= NOW() - INTERVAL '60 days'
-       ORDER BY workout_date DESC`,
-      [req.user.id]
-    );
+    const sixtyDaysAgo = new Date();
+    sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+
+    const workouts = await Workout.find({ 
+      user_id: userId, 
+      completed_at: { $gte: sixtyDaysAgo } 
+    }).sort({ completed_at: -1 }).select('completed_at').lean();
+
+    const dates = [...new Set(workouts.map(w => {
+      const d = new Date(w.completed_at);
+      d.setHours(0, 0, 0, 0);
+      return d.getTime();
+    }))].sort((a, b) => b - a); // Descending
 
     let streak = 0;
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-
-    const dates = streakResult.rows.map(r => {
-      const d = new Date(r.workout_date);
-      d.setHours(0, 0, 0, 0);
-      return d.getTime();
-    });
 
     let checkDate = today.getTime();
     for (const date of dates) {
@@ -59,11 +84,11 @@ router.get('/summary', auth, async (req, res) => {
     }
 
     res.json({
-      workouts_this_week: parseInt(workoutsResult.rows[0].count),
-      calories_this_week: Math.round(parseFloat(workoutsResult.rows[0].calories)),
-      volume_this_week: Math.round(parseFloat(volumeResult.rows[0].total_volume)),
+      workouts_this_week,
+      calories_this_week: Math.round(calories_this_week),
+      volume_this_week: Math.round(volume_this_week),
       current_streak: streak,
-      total_minutes: parseInt(workoutsResult.rows[0].total_minutes),
+      total_minutes: Math.round(total_minutes),
     });
   } catch (err) {
     console.error('Stats summary error:', err);
@@ -74,25 +99,31 @@ router.get('/summary', auth, async (req, res) => {
 // GET /api/stats/progress — workout count per day last 30 days
 router.get('/progress', auth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT 
-        DATE(completed_at) as date,
-        COUNT(*) as count
-       FROM workouts
-       WHERE user_id = $1 AND completed_at >= NOW() - INTERVAL '30 days'
-       GROUP BY DATE(completed_at)
-       ORDER BY date`,
-      [req.user.id]
-    );
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const userId = new mongoose.Types.ObjectId(req.user.id);
 
-    // Fill in missing days with 0
+    const workouts = await Workout.aggregate([
+      { $match: { user_id: userId, completed_at: { $gte: thirtyDaysAgo } } },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%Y-%m-%d", date: "$completed_at" } },
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    const workoutMap = {};
+    workouts.forEach(w => {
+      workoutMap[w._id] = w.count;
+    });
+
     const data = [];
     for (let i = 29; i >= 0; i--) {
       const d = new Date();
       d.setDate(d.getDate() - i);
       const dateStr = d.toISOString().split('T')[0];
-      const found = result.rows.find(r => r.date.toISOString().split('T')[0] === dateStr);
-      data.push({ date: dateStr, count: found ? parseInt(found.count) : 0 });
+      data.push({ date: dateStr, count: workoutMap[dateStr] || 0 });
     }
 
     res.json(data);
@@ -105,24 +136,44 @@ router.get('/progress', auth, async (req, res) => {
 // GET /api/stats/personal-bests — max weight per exercise
 router.get('/personal-bests', auth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT 
-        e.id as exercise_id,
-        e.name as exercise_name,
-        e.muscle_group,
-        MAX(ws.weight_kg) as max_weight_kg,
-        MAX(ws.reps) as max_reps,
-        MAX(w.completed_at) as last_performed
-       FROM workout_sets ws
-       JOIN workouts w ON ws.workout_id = w.id
-       JOIN exercises e ON ws.exercise_id = e.id
-       WHERE w.user_id = $1 AND ws.weight_kg IS NOT NULL AND ws.weight_kg > 0
-       GROUP BY e.id, e.name, e.muscle_group
-       ORDER BY e.muscle_group, e.name`,
-      [req.user.id]
-    );
+    const userId = new mongoose.Types.ObjectId(req.user.id);
 
-    res.json(result.rows);
+    const bests = await Workout.aggregate([
+      { $match: { user_id: userId } },
+      { $unwind: "$sets" },
+      { $match: { "sets.weight_kg": { $gt: 0 } } },
+      {
+        $group: {
+          _id: "$sets.exercise_id",
+          max_weight_kg: { $max: "$sets.weight_kg" },
+          max_reps: { $max: "$sets.reps" },
+          last_performed: { $max: "$completed_at" }
+        }
+      },
+      {
+        $lookup: {
+          from: "exercises",
+          localField: "_id",
+          foreignField: "_id",
+          as: "exercise"
+        }
+      },
+      { $unwind: "$exercise" },
+      {
+        $project: {
+          _id: 0,
+          exercise_id: "$_id",
+          exercise_name: "$exercise.name",
+          muscle_group: "$exercise.muscle_group",
+          max_weight_kg: 1,
+          max_reps: 1,
+          last_performed: 1
+        }
+      },
+      { $sort: { muscle_group: 1, exercise_name: 1 } }
+    ]);
+
+    res.json(bests);
   } catch (err) {
     console.error('Personal bests error:', err);
     res.status(500).json({ error: 'Server error' });
@@ -132,19 +183,35 @@ router.get('/personal-bests', auth, async (req, res) => {
 // GET /api/stats/volume-trend — total kg lifted per week last 8 weeks
 router.get('/volume-trend', auth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT 
-        DATE_TRUNC('week', w.completed_at) as week_start,
-        COALESCE(SUM(ws.weight_kg * ws.reps), 0) as total_volume
-       FROM workouts w
-       LEFT JOIN workout_sets ws ON ws.workout_id = w.id
-       WHERE w.user_id = $1 AND w.completed_at >= NOW() - INTERVAL '8 weeks'
-       GROUP BY DATE_TRUNC('week', w.completed_at)
-       ORDER BY week_start`,
-      [req.user.id]
-    );
+    const eightWeeksAgo = new Date();
+    eightWeeksAgo.setDate(eightWeeksAgo.getDate() - 56);
+    eightWeeksAgo.setHours(0, 0, 0, 0);
 
-    // Fill missing weeks
+    const userId = new mongoose.Types.ObjectId(req.user.id);
+
+    const workouts = await Workout.aggregate([
+      { $match: { user_id: userId, completed_at: { $gte: eightWeeksAgo } } },
+      { $unwind: "$sets" },
+      {
+        $project: {
+          completed_at: 1,
+          volume: { $multiply: [{ $ifNull: ["$sets.weight_kg", 0] }, { $ifNull: ["$sets.reps", 0] }] }
+        }
+      }
+    ]);
+
+    // Calculate in memory to handle week boundaries correctly
+    const weekMap = {};
+    workouts.forEach(w => {
+      const d = new Date(w.completed_at);
+      d.setDate(d.getDate() - d.getDay()); // Start of week (Sunday)
+      d.setHours(0, 0, 0, 0);
+      const weekStr = d.toISOString().split('T')[0];
+      
+      if (!weekMap[weekStr]) weekMap[weekStr] = 0;
+      weekMap[weekStr] += w.volume;
+    });
+
     const data = [];
     for (let i = 7; i >= 0; i--) {
       const weekStart = new Date();
@@ -153,16 +220,10 @@ router.get('/volume-trend', auth, async (req, res) => {
       weekStart.setHours(0, 0, 0, 0);
       const weekStr = weekStart.toISOString().split('T')[0];
 
-      const found = result.rows.find(r => {
-        const rWeek = new Date(r.week_start);
-        rWeek.setDate(rWeek.getDate() - rWeek.getDay());
-        return rWeek.toISOString().split('T')[0] === weekStr;
-      });
-
       data.push({
         week: `W${8 - i}`,
         week_start: weekStr,
-        total_volume: found ? Math.round(parseFloat(found.total_volume)) : 0
+        total_volume: Math.round(weekMap[weekStr] || 0)
       });
     }
 
