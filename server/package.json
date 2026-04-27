@@ -8,7 +8,7 @@
     "dev": "nodemon index.js",
     "migrate": "node db/migrate.js",
     "seed": "node db/seed.js",
-    "build": "echo 'No build step required'"
+    "build": "npm install"
   },
   "keywords": [],
   "author": "",
